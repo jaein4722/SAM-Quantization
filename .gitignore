@@ -1,0 +1,6 @@
+
+*.pth
+*.out
+*.egg-info/
+record/
+__pycache__/

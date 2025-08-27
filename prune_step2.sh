@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=1 python prune_distill_step2.py \
+    --traindata_path ../datasets/sa-1b_split/train \
+    --valdata_path ../datasets/sa-1b_split/val \
+    --trainsize 10000 \
+    --gradsize 1000 \
+    --valsize 50 \
+    --epochs 40 \
+    --norm_type gaussian \
+    --imptype Disturb \
+    --global_way True \
+    --prune_ratio 0.5 \
+    --model_path checkpoints/vit_b_slim_step1_.pth
