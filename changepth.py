@@ -20,7 +20,7 @@ print("CUDA Device Name: " + str(torch.cuda.get_device_name(device)))
 # student_model = sam_model_registry[model_type](checkpoint=checkpoint)
 # print(student_model.image_encoder)
 
-state_dict = torch.load('checkpoints/sam_vit_b_0b3195.pth')
+state_dict = torch.load('checkpoints/sam2.1_hiera_base_plus.pt')
 
 for i in range(0,24):
     originkey = "image_encoder.blocks."+str(i)+".attn.qkv.weight"
@@ -39,6 +39,6 @@ for i in range(0,24):
 for key, value in state_dict.items():
     print(key,value.shape)
 
-torch.save(state_dict,'checkpoints/sam_vit_b_qkv.pth')
+torch.save(state_dict,'checkpoints/sam2.1_hiera_base_plus_qkv.pth')
 
 

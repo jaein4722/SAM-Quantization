@@ -1,6 +1,0 @@
-metric,value
-MACs(G),94.970552892
-Params(M),23.944556
-num_images,1136
-num_gt_instances,114516
-dataset_miou,0.7406

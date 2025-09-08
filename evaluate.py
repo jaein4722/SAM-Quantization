@@ -36,7 +36,31 @@ import matplotlib.pyplot as plt
 
 from knockknock import discord_sender
 from torch_pruning.utils import count_ops_and_params
+import sys
+from PTQ import (
+    MinMaxActWrapper, MinMaxActFakeQuant, MinMaxActObserver,
+    StaticQuantWrapper, FakeQuantize, MinMaxObserver
+)
+from dotenv import load_dotenv
+
+# 저장 당시 기록된 심볼 경로(__main__.*)를 현재 모듈로 매핑
+sys.modules['__main__'].MinMaxActWrapper = MinMaxActWrapper
+sys.modules['__main__'].MinMaxActFakeQuant = MinMaxActFakeQuant
+sys.modules['__main__'].MinMaxActObserver = MinMaxActObserver
+sys.modules['__main__'].StaticQuantWrapper = StaticQuantWrapper
+sys.modules['__main__'].FakeQuantize = FakeQuantize
+sys.modules['__main__'].MinMaxObserver = MinMaxObserver
 # ==================================================
+
+# Load environment variables (expect .env at project root). Missing .env is okay.
+ROOT_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT_DIR / ".env")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+def _noop_decorator(func):
+    return func
+
+_DECORATOR = discord_sender(webhook_url=DISCORD_WEBHOOK_URL) if DISCORD_WEBHOOK_URL else _noop_decorator
 
 def fix_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -715,7 +739,7 @@ def parse_args():
                     help="Ranking metric: auto_segment -> e.g., 'mean_best_iou' or 'prec@0.50'; miou_point -> 'miou'.")
     return ap.parse_args()
 
-@discord_sender(webhook_url="https://discord.com/api/webhooks/1409403260195966976/xUJW-HeySEdTrnJCIJRjRhOlCUenZvaPalp4ELPDYqiVkYe_Z1q21Eu9i3IVw9jQRUzx")
+@_DECORATOR
 def main():
     fix_seed()
     args = parse_args()

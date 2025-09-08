@@ -12,10 +12,14 @@ python PTQ.py \
   --use-torch-load --patch-forward \
   --method minmax \
   --include-conv \
-  --output checkpoints/vit_b_slim_step2_minmax_r.pth \
+  --output checkpoints/vit_b_slim_step2_minmax_W4.pth \
   --minmax-verbose \
+  --calib-dir ../datasets/sa-1b_split/val \
+  --calib-size 50 \
   --verify-image images/truck.jpg \
-  --verify-point 750 370
+  --verify-point 750 370 \
+  --w-bits 4 \
+  --a-bits 4 \
 
 # CUDA_VISIBLE_DEVICES=1 python PTQ.py \
 #   --checkpoint checkpoints/vit_b_slim_step2_.pth \
@@ -28,4 +32,5 @@ python PTQ.py \
 #   --calib-size 50 \
 #   --lambda-reg 1e-2 \
 #   --verify-image images/truck.jpg \
-#   --verify-point 750 370
+#   --verify-point 750 370 \
+#   --w-bits 4 \

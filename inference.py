@@ -6,6 +6,19 @@ from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskG
 from segment_anything_kd.modeling.image_encoder import add_decomposed_rel_pos
 import matplotlib.pyplot as plt
 import torch_pruning as tp
+import sys
+from PTQ import (
+    MinMaxActWrapper, MinMaxActFakeQuant, MinMaxActObserver,
+    StaticQuantWrapper, FakeQuantize, MinMaxObserver
+)
+
+# 저장 당시 기록된 심볼 경로(__main__.*)를 현재 모듈로 매핑
+sys.modules['__main__'].MinMaxActWrapper = MinMaxActWrapper
+sys.modules['__main__'].MinMaxActFakeQuant = MinMaxActFakeQuant
+sys.modules['__main__'].MinMaxActObserver = MinMaxActObserver
+sys.modules['__main__'].StaticQuantWrapper = StaticQuantWrapper
+sys.modules['__main__'].FakeQuantize = FakeQuantize
+sys.modules['__main__'].MinMaxObserver = MinMaxObserver
 
 def calculate_iou(mask1, mask2):
     """
@@ -83,7 +96,7 @@ def test_model():
     # SlimSAM_model.to(device)
     # SlimSAM_model.eval()
 
-    model_path = "checkpoints/vit_b_slim_step2_minmax.pth"
+    model_path = "checkpoints/vit_b_slim_step2_minmax_W3A4.pth"
     SlimSAM_model = torch.load(model_path, weights_only=False)
     enc = SlimSAM_model.image_encoder
     if isinstance(enc, (nn.DataParallel, nn.parallel.DistributedDataParallel)):

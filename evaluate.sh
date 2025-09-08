@@ -10,9 +10,9 @@
 CUDA_VISIBLE_DEVICES=5 python evaluate.py \
   --data_root ../datasets/sa-1b_split/test \
   --model slimsam_global \
-  --ckpt checkpoints/vit_b_slim_step2_minmax_r.pth \
+  --ckpt checkpoints/vit_b_slim_step2_minmax_W4.pth \
   --eval_mode miou_point \
-  --out_dir ./eval_results/slimsam50_global_minmax_conv \
+  --out_dir ./eval_results/slimsam50_global_minmax_conv_W4 \
   --viz_percent 5 \
   --viz_metric miou
 

@@ -1,6 +1,7 @@
-
+*.env
 *.pth
 *.out
 *.egg-info/
 record/
 __pycache__/
+eval_results/*

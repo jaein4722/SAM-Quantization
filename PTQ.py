@@ -6,6 +6,13 @@ import torch
 import torch.nn as nn
 
 
+def _validate_bits(name: str, bits: int, min_bits: int = 2, max_bits: int = 8) -> int:
+    """비트폭 유효성 검사 및 반환."""
+    if bits < min_bits or bits > max_bits:
+        raise ValueError(f"--{name} 는 {min_bits}-{max_bits} 범위여야 합니다: {bits}")
+    return bits
+
+
 def _patch_image_encoder_forward_for_global(image_encoder: nn.Module) -> None:
     """
     SlimSAM 학습 체크포인트(torch.load로 로드되는 글로벌 변형)를 사용할 때,
@@ -97,7 +104,7 @@ def quantize_slimsam_dynamic(
 
 
 @torch.no_grad()
-def _fake_quantize_weight_per_channel(w: torch.Tensor) -> torch.Tensor:
+def _fake_quantize_weight_per_channel(w: torch.Tensor, w_bits: int = 8) -> torch.Tensor:
     """대칭 per-channel 가중치 fake-quantize (int8→dequantize). 채널은 dim=0으로 가정.
     Linear: [out_features, in_features]
     Conv2d: [out_channels, in_channels, kH, kW]
@@ -107,23 +114,27 @@ def _fake_quantize_weight_per_channel(w: torch.Tensor) -> torch.Tensor:
     c = w_view.shape[0]
     w_flat = w_view.reshape(c, -1)
     max_abs = w_flat.abs().amax(dim=1)  # [C]
-    scale = torch.where(max_abs > 0, max_abs / 127.0, torch.ones_like(max_abs))  # [C]
-    # q = clamp(round(w/scale), -127, 127)
+    qmax = float(2 ** (w_bits - 1) - 1)
+    qmin = -qmax
+    scale = torch.where(max_abs > 0, max_abs / qmax, torch.ones_like(max_abs))  # [C]
+    # q = clamp(round(w/scale), qmin, qmax)
     # reshape scale for broadcasting
     new_shape = [c] + [1] * (w_view.dim() - 1)
     scale_bc = scale.reshape(new_shape)
-    q = torch.round(w_view / scale_bc).clamp_(-127, 127).to(torch.int8)
+    q = torch.round(w_view / scale_bc).clamp_(qmin, qmax).to(torch.int8)
     dq = q.to(torch.float32) * scale_bc
     return dq.to(orig_dtype)
 
 
 @torch.no_grad()
-def _fake_quantize_weight_per_tensor(w: torch.Tensor) -> torch.Tensor:
+def _fake_quantize_weight_per_tensor(w: torch.Tensor, w_bits: int = 8) -> torch.Tensor:
     """대칭 per-tensor 가중치 fake-quantize (int8→dequantize)."""
     orig_dtype = w.dtype
     max_abs = w.detach().abs().max()
-    scale = (max_abs / 127.0) if max_abs > 0 else torch.tensor(1.0, device=w.device, dtype=torch.float32)
-    q = torch.round(w.detach() / scale).clamp_(-127, 127).to(torch.int8)
+    qmax = float(2 ** (w_bits - 1) - 1)
+    qmin = -qmax
+    scale = (max_abs / qmax) if max_abs > 0 else torch.tensor(1.0, device=w.device, dtype=torch.float32)
+    q = torch.round(w.detach() / scale).clamp_(qmin, qmax).to(torch.int8)
     dq = q.to(torch.float32) * scale
     return dq.to(orig_dtype)
 
@@ -132,6 +143,7 @@ def _apply_minmax_fake_quant(
     module: nn.Module,
     include_conv: bool,
     per_tensor: bool,
+    w_bits: int,
 ) -> Tuple[int, float, float]:
     """모듈 트리 전체를 순회하며 Linear(및 선택적으로 Conv2d) 가중치에 MinMax fake-quant 적용.
     반환: (수정한 모듈 수, 수정된 가중치의 최대 차이 합, 평균 차이 합)
@@ -146,9 +158,9 @@ def _apply_minmax_fake_quant(
             with torch.no_grad():
                 w0 = m.weight.detach().clone()
                 if per_tensor:
-                    dq = _fake_quantize_weight_per_tensor(w0)
+                    dq = _fake_quantize_weight_per_tensor(w0, w_bits=w_bits)
                 else:
-                    dq = _fake_quantize_weight_per_channel(w0)
+                    dq = _fake_quantize_weight_per_channel(w0, w_bits=w_bits)
                 m.weight.data.copy_(dq)
                 d = (dq - w0).abs()
                 sum_max_diff += float(d.max().item()) if d.numel() > 0 else 0.0
@@ -164,6 +176,7 @@ def quantize_slimsam_minmax_weights(
     quantize_mask_decoder: bool = True,
     include_conv: bool = False,
     per_tensor: bool = False,
+    w_bits: int = 8,
 ) -> nn.Module:
     """
     MinMax 기반 weight-only fake quantization.
@@ -176,13 +189,13 @@ def quantize_slimsam_minmax_weights(
     total_max_diff = 0.0
     total_mean_diff = 0.0
     if quantize_image_encoder and hasattr(model, "image_encoder"):
-        c, mx, mn = _apply_minmax_fake_quant(model.image_encoder, include_conv=include_conv, per_tensor=per_tensor)
+        c, mx, mn = _apply_minmax_fake_quant(model.image_encoder, include_conv=include_conv, per_tensor=per_tensor, w_bits=w_bits)
         total_changed += c; total_max_diff += mx; total_mean_diff += mn
     if quantize_prompt_encoder and hasattr(model, "prompt_encoder"):
-        c, mx, mn = _apply_minmax_fake_quant(model.prompt_encoder, include_conv=include_conv, per_tensor=per_tensor)
+        c, mx, mn = _apply_minmax_fake_quant(model.prompt_encoder, include_conv=include_conv, per_tensor=per_tensor, w_bits=w_bits)
         total_changed += c; total_max_diff += mx; total_mean_diff += mn
     if quantize_mask_decoder and hasattr(model, "mask_decoder"):
-        c, mx, mn = _apply_minmax_fake_quant(model.mask_decoder, include_conv=include_conv, per_tensor=per_tensor)
+        c, mx, mn = _apply_minmax_fake_quant(model.mask_decoder, include_conv=include_conv, per_tensor=per_tensor, w_bits=w_bits)
         total_changed += c; total_max_diff += mx; total_mean_diff += mn
     # 요약 저장을 위해 속성에 기록 (선택적)
     setattr(model, "_minmax_changed_layers", int(total_changed))
@@ -194,6 +207,158 @@ def quantize_slimsam_minmax_weights(
 def save_quantized_model(model: nn.Module, output_path: str) -> None:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     torch.save(model, output_path)
+
+# =========================
+# MinMax Activation Quantization (with calibration)
+# =========================
+
+class MinMaxActObserver:
+    def __init__(self):
+        self.min_val: Optional[torch.Tensor] = None
+        self.max_val: Optional[torch.Tensor] = None
+
+    @torch.no_grad()
+    def observe(self, x: torch.Tensor) -> None:
+        x_detached = x.detach()
+        cur_min = x_detached.amin()
+        cur_max = x_detached.amax()
+        if self.min_val is None:
+            self.min_val = cur_min
+            self.max_val = cur_max
+        else:
+            self.min_val = torch.minimum(self.min_val, cur_min)
+            self.max_val = torch.maximum(self.max_val, cur_max)
+
+    @torch.no_grad()
+    def get_scale(self, qmax: float = 127.0) -> torch.Tensor:
+        if self.min_val is None or self.max_val is None:
+            return torch.tensor(1.0)
+        max_abs = torch.maximum(self.max_val.abs(), self.min_val.abs())
+        scale = max_abs / qmax
+        scale = torch.where(scale > 0, scale, torch.tensor(1.0, device=scale.device, dtype=scale.dtype))
+        return scale
+
+
+class MinMaxActFakeQuant(nn.Module):
+    def __init__(self, a_bits: int = 8) -> None:
+        super().__init__()
+        self.observer = MinMaxActObserver()
+        self.calibrate_mode: bool = False
+        self.enabled: bool = False
+        self.a_bits: int = int(a_bits)
+        self._qmax: float = float(2 ** (self.a_bits - 1) - 1)
+        self._qmin: float = -self._qmax
+
+    def set_calibrate(self, is_calibrate: bool) -> None:
+        self.calibrate_mode = is_calibrate
+
+    def set_enable(self, is_enabled: bool) -> None:
+        self.enabled = is_enabled
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.calibrate_mode:
+            self.observer.observe(x)
+            return x
+        if self.enabled:
+            scale = self.observer.get_scale(self._qmax)
+            q = torch.round(x / scale).clamp_(self._qmin, self._qmax).to(torch.int8)
+            x = q.to(torch.float32) * scale
+            return x.to(dtype=x.dtype)
+        return x
+
+
+class MinMaxActWrapper(nn.Module):
+    def __init__(self, module: nn.Module, quantize_input: bool = True, quantize_output: bool = True, a_bits: int = 8) -> None:
+        super().__init__()
+        self.module = module
+        self.input_quant = MinMaxActFakeQuant(a_bits=a_bits) if quantize_input else None
+        self.output_quant = MinMaxActFakeQuant(a_bits=a_bits) if quantize_output else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_quant is not None:
+            x = self.input_quant(x)
+        x = self.module(x)
+        if self.output_quant is not None:
+            x = self.output_quant(x)
+        return x
+
+
+def _insert_minmax_activation_quant(
+    module: nn.Module,
+    include_conv: bool,
+    quantize_input: bool,
+    quantize_output: bool,
+    a_bits: int,
+) -> int:
+    """nn.Linear (옵션으로 nn.Conv2d) 앞/뒤에 MinMax 기반 활성 가짜양자화 래퍼 삽입."""
+    count = 0
+    target_types = (nn.Linear,) + ((nn.Conv2d,) if include_conv else tuple())
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, MinMaxActWrapper):
+            continue
+        if isinstance(child, target_types):
+            setattr(module, name, MinMaxActWrapper(child, quantize_input=quantize_input, quantize_output=quantize_output, a_bits=a_bits))
+            count += 1
+        else:
+            count += _insert_minmax_activation_quant(child, include_conv, quantize_input, quantize_output, a_bits)
+    return count
+
+
+def _set_minmax_act_calibration_mode(module: nn.Module, calibrate: bool) -> None:
+    for m in module.modules():
+        if isinstance(m, MinMaxActFakeQuant):
+            m.set_calibrate(calibrate)
+            if calibrate:
+                m.set_enable(False)
+
+
+def _set_minmax_act_enabled(module: nn.Module, enabled: bool) -> None:
+    for m in module.modules():
+        if isinstance(m, MinMaxActFakeQuant):
+            m.set_enable(enabled)
+            if enabled:
+                m.set_calibrate(False)
+
+
+def calibrate_minmax_activation_with_images(
+    model: nn.Module,
+    images_dir: str,
+    max_images: int,
+    device: str = "cpu",
+    run_decoder: bool = True,
+) -> None:
+    """이미지 폴더를 사용해 MinMax 활성화 캘리브레이션 수행."""
+    import os
+    import glob
+    import numpy as np
+    import cv2
+    from segment_anything import SamPredictor
+
+    model.to(device).eval()
+    predictor = SamPredictor(model)
+
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+    files = []
+    for e in exts:
+        files.extend(glob.glob(os.path.join(images_dir, e)))
+    files = sorted(files)[: max_images]
+
+    _set_minmax_act_calibration_mode(model, True)
+    for p in files:
+        img = cv2.imread(p)
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        predictor.set_image(img)
+        if run_decoder:
+            h, w = img.shape[:2]
+            cx, cy = w // 2, h // 2
+            pts = np.array([[cx, cy]], dtype=np.float32)
+            lbs = np.array([1], dtype=np.int32)
+            with torch.no_grad():
+                predictor.predict(point_coords=pts, point_labels=lbs, multimask_output=False)
+    _set_minmax_act_calibration_mode(model, False)
 
 # =========================
 # Static PTQ (activation fake-quant with calibration)
@@ -217,21 +382,24 @@ class MinMaxObserver:
             self.max_val = torch.maximum(self.max_val, cur_max)
 
     @torch.no_grad()
-    def get_scale(self) -> torch.Tensor:
+    def get_scale(self, qmax: float = 127.0) -> torch.Tensor:
         if self.min_val is None or self.max_val is None:
             return torch.tensor(1.0)
         max_abs = torch.maximum(self.max_val.abs(), self.min_val.abs())
-        scale = max_abs / 127.0
+        scale = max_abs / qmax
         scale = torch.where(scale > 0, scale, torch.tensor(1.0, device=scale.device, dtype=scale.dtype))
         return scale
 
 
 class FakeQuantize(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, a_bits: int = 8) -> None:
         super().__init__()
         self.observer = MinMaxObserver()
         self.calibrate_mode: bool = False
         self.enabled: bool = False
+        self.a_bits: int = int(a_bits)
+        self._qmax: float = float(2 ** (self.a_bits - 1) - 1)
+        self._qmin: float = -self._qmax
 
     def set_calibrate(self, is_calibrate: bool) -> None:
         self.calibrate_mode = is_calibrate
@@ -244,19 +412,19 @@ class FakeQuantize(nn.Module):
             self.observer.observe(x)
             return x
         if self.enabled:
-            scale = self.observer.get_scale()
-            q = torch.round(x / scale).clamp_(-127, 127).to(torch.int8)
+            scale = self.observer.get_scale(self._qmax)
+            q = torch.round(x / scale).clamp_(self._qmin, self._qmax).to(torch.int8)
             x = q.to(torch.float32) * scale
             return x.to(dtype=x.dtype)
         return x
 
 
 class StaticQuantWrapper(nn.Module):
-    def __init__(self, module: nn.Module, quantize_input: bool = True, quantize_output: bool = True) -> None:
+    def __init__(self, module: nn.Module, quantize_input: bool = True, quantize_output: bool = True, a_bits: int = 8) -> None:
         super().__init__()
         self.module = module
-        self.input_quant = FakeQuantize() if quantize_input else None
-        self.output_quant = FakeQuantize() if quantize_output else None
+        self.input_quant = FakeQuantize(a_bits=a_bits) if quantize_input else None
+        self.output_quant = FakeQuantize(a_bits=a_bits) if quantize_output else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_quant is not None:
@@ -272,6 +440,7 @@ def _insert_static_act_quant(
     include_conv: bool,
     quantize_input: bool,
     quantize_output: bool,
+    a_bits: int,
 ) -> int:
     """nn.Linear (옵션으로 nn.Conv2d)을 StaticQuantWrapper로 교체. 반환: 래핑된 모듈 수"""
     count = 0
@@ -281,10 +450,10 @@ def _insert_static_act_quant(
         if isinstance(child, StaticQuantWrapper):
             continue
         if isinstance(child, target_types):
-            setattr(module, name, StaticQuantWrapper(child, quantize_input=quantize_input, quantize_output=quantize_output))
+            setattr(module, name, StaticQuantWrapper(child, quantize_input=quantize_input, quantize_output=quantize_output, a_bits=a_bits))
             count += 1
         else:
-            count += _insert_static_act_quant(child, include_conv, quantize_input, quantize_output)
+            count += _insert_static_act_quant(child, include_conv, quantize_input, quantize_output, a_bits)
     return count
 
 
@@ -550,7 +719,7 @@ def run_single_verify(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SlimSAM PTQ: dynamic, MinMax(weight-only), static(activation)")
+    parser = argparse.ArgumentParser(description="SlimSAM PTQ: dynamic, MinMax(weight-only)")
     group_load = parser.add_argument_group("load")
     group_load.add_argument("--checkpoint", type=str, default=None, help="모델 체크포인트 경로")
     group_load.add_argument("--model-type", type=str, default=None, help="sam_model_registry 키 (예: vit_b, vit_h, vit_p77)")
@@ -558,21 +727,20 @@ def main():
     group_load.add_argument("--patch-forward", action="store_true", help="inference.py와 같이 image_encoder.forward 패치")
 
     group_q = parser.add_argument_group("quant")
-    group_q.add_argument("--method", type=str, choices=["dynamic", "minmax", "static"], default="dynamic", help="PTQ 방식 선택")
+    group_q.add_argument("--method", type=str, choices=["dynamic", "minmax"], default="dynamic", help="PTQ 방식 선택")
     group_q.add_argument("--no-enc", action="store_true", help="image_encoder 양자화 비활성화")
     group_q.add_argument("--no-prompt", action="store_true", help="prompt_encoder 양자화 비활성화")
     group_q.add_argument("--no-dec", action="store_true", help="mask_decoder 양자화 비활성화")
+    
+    group_q.add_argument("--w-bits", type=int, default=8, help="가중치 양자화 비트폭 (2-8). MinMax에 적용")
+    group_q.add_argument("--a-bits", type=int, default=None, help="활성화 양자화 비트폭 (2-8). MinMax에 적용")
+    
     # MinMax 관련 옵션
+    group_q.add_argument("--minmax-act-input", action="store_true", help="MinMax 활성화에서 레이어 입력을 양자화")
+    group_q.add_argument("--minmax-act-output", action="store_true", help="MinMax 활성화에서 레이어 출력을 양자화")
     group_q.add_argument("--minmax-per-tensor", action="store_true", help="MinMax를 per-tensor로 적용 (기본: per-channel)")
     group_q.add_argument("--include-conv", action="store_true", help="MinMax에서 Conv2d 가중치도 포함")
     group_q.add_argument("--minmax-verbose", action="store_true", help="MinMax 적용 요약(변경 레이어 수/차이) 출력")
-
-    # Static PTQ (activation) 옵션
-    group_static = parser.add_argument_group("static-ptq")
-    group_static.add_argument("--static-include-conv", action="store_true", help="Static에서 Conv2d 활성도 래핑")
-    group_static.add_argument("--static-quant-input", action="store_true", help="각 레이어 입력 활성 quant", default=True)
-    group_static.add_argument("--static-quant-output", action="store_true", help="각 레이어 출력 활성 quant", default=True)
-    group_static.add_argument("--static-run-decoder", action="store_true", help="캘리브레이션 시 mask decoder까지 실행", default=False)
 
     # Calibration (Q-SAM2 style) 옵션
     group_cal = parser.add_argument_group("calibration")
@@ -581,15 +749,23 @@ def main():
     group_cal.add_argument("--calib-size", type=int, default=64, help="캘리브 이미지 개수 상한")
     group_cal.add_argument("--lambda-reg", type=float, default=1e-3, help="릿지 정규화 계수 λ")
 
+    # Output
     group_out = parser.add_argument_group("output")
     group_out.add_argument("--output", type=str, required=True, help="양자화된 모델 저장 경로 (*.pth)")
 
+    # Verify
     group_verify = parser.add_argument_group("verify")
     group_verify.add_argument("--verify-image", type=str, default=None, help="간단 검증용 이미지 경로")
     group_verify.add_argument("--verify-point", type=int, nargs=2, default=None, metavar=("X", "Y"), help="검증용 포인트 (x y)")
     group_verify.add_argument("--verify-box", type=int, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"), help="검증용 박스 (x0 y0 x1 y1)")
 
     args = parser.parse_args()
+
+    # 비트폭 유효성 검사
+    w_bits = _validate_bits("w-bits", int(args.w_bits), min_bits=2, max_bits=8)
+    a_bits = None
+    if args.a_bits is not None:
+        a_bits = _validate_bits("a-bits", int(args.a_bits), min_bits=2, max_bits=8)
 
     # 모델 로드 (기본은 CPU로 로드하여 바로 양자화 가능하도록 함)
     device_for_load = "cpu" if args.use_torch_load else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -621,6 +797,9 @@ def main():
     # PTQ 수행
     if args.method == "dynamic":
         # Dynamic PTQ (CPU 전용, Linear 대상)
+        if w_bits != 8:
+            # PyTorch 기본 dynamic quant는 int8 고정이므로 경고/에러 처리
+            raise ValueError("--method dynamic 에서는 --w-bits 는 8만 지원합니다.")
         q_model = quantize_slimsam_dynamic(
             model,
             quantize_image_encoder=not args.no_enc,
@@ -636,7 +815,37 @@ def main():
             quantize_mask_decoder=not args.no_dec,
             include_conv=args.include_conv,
             per_tensor=args.minmax_per_tensor,
+            w_bits=w_bits,
         )
+        # (옵션) MinMax 활성화 양자화: 감싼 뒤 이미지로 캘리브레이션 → 활성화
+        if a_bits is not None:
+            targets: List[Tuple[str, bool]] = [
+                ("image_encoder", not args.no_enc),
+                ("prompt_encoder", not args.no_prompt),
+                ("mask_decoder", not args.no_dec),
+            ]
+            wrapped = 0
+            for attr, enable in targets:
+                if enable and hasattr(q_model, attr):
+                    wrapped += _insert_minmax_activation_quant(
+                        getattr(q_model, attr),
+                        include_conv=args.include_conv,
+                        quantize_input=args.minmax_act_input,
+                        quantize_output=args.minmax_act_output,
+                        a_bits=a_bits,
+                    )
+            if args.calib_dir is None:
+                raise ValueError("MinMax 활성화 적용 시 --calib-dir 가 필요합니다.")
+            device_for_act = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[MinMax-Act] wrapped_layers={wrapped}. Calibrating on {device_for_act} …")
+            calibrate_minmax_activation_with_images(
+                q_model,
+                images_dir=args.calib_dir,
+                max_images=args.calib_size,
+                device=device_for_act,
+                run_decoder=False,
+            )
+            _set_minmax_act_enabled(q_model, True)
         if args.minmax_verbose:
             print(
                 f"[MinMax] changed_layers={getattr(q_model, '_minmax_changed_layers', -1)} "
@@ -644,35 +853,7 @@ def main():
                 f"sum_mean_diff={getattr(q_model, '_minmax_sum_mean_diff', -1.0):.6f}"
             )
     else:
-        # Static activation fake-quant: 래핑 → 캘리브레이션 → 활성화
-        # 1) 대상 서브모듈 지정
-        targets: List[Tuple[str, bool]] = [
-            ("image_encoder", not args.no_enc),
-            ("prompt_encoder", not args.no_prompt),
-            ("mask_decoder", not args.no_dec),
-        ]
-        wrapped = 0
-        for attr, enable in targets:
-            if enable and hasattr(model, attr):
-                wrapped += _insert_static_act_quant(
-                    getattr(model, attr),
-                    include_conv=args.static_include_conv,
-                    quantize_input=args.static_quant_input,
-                    quantize_output=args.static_quant_output,
-                )
-        if args.calib_dir is None:
-            raise ValueError("--method static 사용 시 --calib-dir 가 필요합니다.")
-        device_for_static = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[Static] wrapped_layers={wrapped}. Calibrating on {device_for_static} …")
-        calibrate_with_images(
-            model,
-            images_dir=args.calib_dir,
-            max_images=args.calib_size,
-            device=device_for_static,
-            run_decoder=args.static_run_decoder,
-        )
-        _set_quantize_enabled(model, True)
-        q_model = model
+        raise ValueError("--method 는 dynamic 또는 minmax 중 하나여야 합니다.")
 
     # 저장
     save_quantized_model(q_model, args.output)
